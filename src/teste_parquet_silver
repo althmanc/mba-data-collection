@@ -1,0 +1,50 @@
+from minio import Minio
+from pyspark.sql import SparkSession
+import os, tempfile, shutil
+
+# ===== CONFIG =====
+minio_client = Minio(
+    "minio:9000",
+    access_key="minioadmin",
+    secret_key="minioadmin",
+    secure=False
+)
+
+bucket = "datalake"
+prefix = "silver/pedidos_externos_itens/"   # mude para outro silver se quiser
+
+# ===== 1️⃣ BAIXAR TODOS OS PARQUETS =====
+tmp_dir = tempfile.mkdtemp(prefix="read_parquet_minio_")
+local_files = []
+
+for obj in minio_client.list_objects(bucket, prefix=prefix, recursive=True):
+    if obj.object_name.lower().endswith(".parquet"):
+        local_path = os.path.join(tmp_dir, os.path.basename(obj.object_name))
+        minio_client.fget_object(bucket, obj.object_name, local_path)
+        local_files.append(local_path)
+
+if not local_files:
+    raise Exception(f"Nenhum parquet encontrado em {bucket}/{prefix}")
+
+print(f"📦 {len(local_files)} arquivos baixados de {bucket}/{prefix}")
+
+# ===== 2️⃣ LER LOCALMENTE NO SPARK =====
+spark = (
+    SparkSession.builder
+    .appName("ReadParquetsFromMinIO_via_SDK")
+    .getOrCreate()
+)
+
+df = spark.read.parquet(*[f"file://{p}" for p in local_files])
+
+# ===== 3️⃣ PRINTAR AS INFORMAÇÕES =====
+print("📊 SCHEMA:")
+df.printSchema()
+
+print("\n🔍 EXEMPLO DE LINHAS:")
+df.show(20, truncate=False)
+
+print(f"\nTotal de linhas: {df.count()}")
+
+# ===== 4️⃣ LIMPAR TMP (opcional) =====
+shutil.rmtree(tmp_dir, ignore_errors=True)
