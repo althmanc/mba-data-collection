@@ -15,7 +15,7 @@ MINIO_SECURE     = os.getenv("MINIO_SECURE", "false").lower() == "true"
 
 BUCKET = os.getenv("DL_BUCKET", "datalake")
 
-# Pastas BRONZE (famílias)
+# Pastas BRONZE
 BRONZE_ROOT = "bronze/json/"
 FAM_EXTRATO   = "dados_extrato/"
 FAM_PEDIDOS   = "dados_pedidos/"
@@ -29,9 +29,6 @@ SILVER_PEDIDOS_ITENS   = "silver/pedidos_externos_itens/"
 SILVER_PRODUTOS        = "silver/produtos_parceiros/"
 SILVER_TAGS            = "silver/tags_produtos/"
 
-# =======================
-# MinIO helpers
-# =======================
 def connect_minio() -> Minio:
     cli = Minio(
         MINIO_ENDPOINT,
@@ -39,24 +36,13 @@ def connect_minio() -> Minio:
         secret_key=MINIO_SECRET_KEY,
         secure=MINIO_SECURE,
     )
-    cli.list_buckets()  # sanity
+    cli.list_buckets()
     return cli
 
-def latest_partition_and_file(
-    cli: Minio,
-    family_prefix: str
-) -> Tuple[str, str]:
-    """
-    Dentro de bronze/json/<familia>/data=YYYYMMDD/ encontra:
-    - a MAIOR partição de data
-    - o .json mais recente dentro dela
-    Retorna (data_str, object_name)
-    """
+def latest_partition_and_file(cli: Minio, family_prefix: str) -> Tuple[str, str]:
     base = f"{BRONZE_ROOT}{family_prefix}"
-    # 1) descobrir as datas disponíveis
     re_data = re.compile(rf"^{re.escape(base)}data=(\d{{8}})/$")
     dates = set()
-    # list_objects recursivo=False lista os "marcadores" de pasta
     for obj in cli.list_objects(BUCKET, prefix=base, recursive=False):
         m = re_data.match(obj.object_name)
         if m:
@@ -64,10 +50,9 @@ def latest_partition_and_file(
     if not dates:
         raise RuntimeError(f"Nenhuma partição data=YYYYMMDD em s3://{BUCKET}/{base}")
 
-    max_date = max(dates)  # maior YYYYMMDD
+    max_date = max(dates)
     date_prefix = f"{base}data={max_date}/"
 
-    # 2) escolher o arquivo .json mais novo nessa data
     latest = None
     for obj in cli.list_objects(BUCKET, prefix=date_prefix, recursive=False):
         if obj.object_name.lower().endswith(".json"):
@@ -75,6 +60,7 @@ def latest_partition_and_file(
                 latest = obj
     if latest is None:
         raise RuntimeError(f"Nenhum .json em s3://{BUCKET}/{date_prefix}")
+
     return max_date, latest.object_name
 
 def fget_to_local(cli: Minio, object_name: str, local_path: str):
@@ -98,34 +84,41 @@ def upload_directory(cli: Minio, local_dir: str, dest_prefix: str):
             cli.fput_object(BUCKET, key, full)
             print(f"PUT s3://{BUCKET}/{key}")
 
-# =======================
-# Spark transforms
-# =======================
 def write_parquet_local(df, out_dir: str):
-    # remove restos e grava
     if os.path.exists(out_dir):
         shutil.rmtree(out_dir, ignore_errors=True)
-    (df.write.mode("overwrite").parquet(out_dir))
-    # remover marcadores
+    df.write.mode("overwrite").parquet(out_dir)
     for marker in ["_SUCCESS", "._SUCCESS"]:
         mpath = os.path.join(out_dir, marker)
         if os.path.exists(mpath):
             os.remove(mpath)
 
+# ==========================================================
+# 1) Extrato -> transacoes silver
+# ==========================================================
 def process_extrato(spark, local_json_in: str, local_out_dir: str):
     df = spark.read.option("multiline", "true").json(f"file://{local_json_in}")
+
     df_trn = (
-        df.withColumn("trans", F.explode_outer("transacoes")) 
-        # df.withColumn("cli", F.explode_outer("cliente"))
-          .select(
-              "id_extrato",
-              F.col("trans.*"),
-              F.col("conta.numero_conta").alias("numero_conta"),
-              F.col("cliente.cliente_id").alias("cliente_id")
-          )
+        df
+        .withColumn("transacao", F.explode_outer("transacoes"))
+        .select(
+            F.col("id_extrato"),
+            F.col("cliente.cliente_id").alias("cliente_id"),
+            F.col("conta.numero_conta").alias("numero_conta"),
+            F.col("transacao.id_transacao").alias("id_transacao"),
+            F.col("transacao.data").alias("data_transacao"),
+            F.col("transacao.descricao").alias("descricao"),
+            F.col("transacao.valor").alias("valor"),
+            F.col("transacao.tipo").alias("tipo")
+        )
     )
+
     write_parquet_local(df_trn, local_out_dir)
 
+# ==========================================================
+# 2) Pedidos -> header e itens silver
+# ==========================================================
 def process_pedidos(spark, local_json_in: str, local_out_hdr: str, local_out_itens: str):
     df = spark.read.option("multiline", "true").json(f"file://{local_json_in}")
 
@@ -141,45 +134,67 @@ def process_pedidos(spark, local_json_in: str, local_out_hdr: str, local_out_ite
         F.col("entrega.endereco.complemento").alias("end_complemento"),
         F.col("entrega.endereco.cidade").alias("end_cidade"),
         F.col("entrega.endereco.estado").alias("end_estado"),
-        F.col("entrega.endereco.cep").alias("end_cep"),
+        F.col("entrega.endereco.cep").alias("end_cep")
     )
+
+    write_parquet_local(df_hdr, local_out_hdr)
 
     df_itens = (
-        df.withColumn("item", F.explode_outer("itens"))
-          .select(
-              "id_pedido",
-              F.col("item.sku").alias("sku"),
-              F.col("item.produto").alias("produto"),
-              F.col("item.quantidade").alias("quantidade"),
-              F.col("item.preco_unitario").alias("preco_unitario"),
-          )
+        df
+        .withColumn("item", F.explode_outer("itens"))
+        .select(
+            "id_pedido",
+            F.col("item.sku").alias("sku"),
+            F.col("item.produto").alias("produto"),
+            F.col("item.quantidade").alias("quantidade"),
+            F.col("item.preco_unitario").alias("preco_unitario")
+        )
     )
 
-    write_parquet_local(df_hdr,   local_out_hdr)
     write_parquet_local(df_itens, local_out_itens)
 
+# ==========================================================
+# 3) Produtos -> flatten silver
+# ==========================================================
 def process_produtos(spark, local_json_in: str, local_out_dir: str):
     df_raw = spark.read.option("multiline", "true").json(f"file://{local_json_in}")
-    # explode 'produtos' se vier embrulhado
-    df_p = df_raw.withColumn("p", F.explode_outer("produtos")).select("p.*") if "produtos" in df_raw.columns else df_raw
-    # flatten genérico de 'especificacoes' para string json
-    if "especificacoes" in df_p.columns:
-        df_p = df_p.withColumn("especificacoes_json", F.to_json(F.col("especificacoes"))).drop("especificacoes")
-    write_parquet_local(df_p, local_out_dir)
+    df = df_raw.withColumn("p", F.explode_outer("produtos")).select("p.*")
 
+    df_flat = (
+        df
+        .withColumn("processador", F.col("especificacoes.processador"))
+        .withColumn("ram", F.col("especificacoes.ram"))
+        .withColumn("armazenamento", F.col("especificacoes.armazenamento"))
+        .withColumn("origem", F.col("detalhes.origem"))
+        .withColumn("peso_g", F.col("detalhes.peso_g"))
+        .withColumn("torra", F.col("detalhes.torra"))
+        .drop("especificacoes", "detalhes", "avaliacoes")
+    )
+
+    write_parquet_local(df_flat, local_out_dir)
+
+# ==========================================================
+# 4) Tags -> explode silver
+# ==========================================================
 def process_tags(spark, local_json_in: str, local_out_dir: str):
-    df = spark.read.option("multiline", "true").json(f"file://{local_json_in}")
-    # garantir array<string> e substituir null por []
-    empty_arr = F.from_json(F.lit("[]"), T.ArrayType(T.StringType()))
-    if "tags" in df.columns:
-        df = df.withColumn("tags", F.when(F.col("tags").isNull(), empty_arr).otherwise(F.col("tags")))
-    else:
-        df = df.withColumn("tags", empty_arr)
-    write_parquet_local(df, local_out_dir)
+    df = spark.read.option("multiline","true").json(f"file://{local_json_in}")
 
-# =======================
-# Main
-# =======================
+    empty_arr = F.array()
+
+    df_norm = (
+        df
+        .withColumn("tags", F.when(F.col("tags").isNull(), empty_arr).otherwise(F.col("tags")))
+        .withColumn("tag", F.explode_outer("tags"))
+        .select(
+            F.col("produto_id"),
+            F.col("nome").alias("produto_nome"),
+            F.col("tag")
+        )
+    )
+
+    write_parquet_local(df_norm, local_out_dir)
+
+# ==========================================================
 def main():
     spark = SparkSession.builder.appName("Bronze->Silver Loja (MinIO SDK)").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
@@ -187,18 +202,17 @@ def main():
 
     work = tempfile.mkdtemp(prefix="silver_loja_")
     try:
-        # ---------- EXTRATO ----------
+        # EXTRATO
         date_extrato, obj_extrato = latest_partition_and_file(cli, FAM_EXTRATO)
         local_extrato = os.path.join(work, "dados_extrato.json")
         fget_to_local(cli, obj_extrato, local_extrato)
 
         out_extrato_local = os.path.join(work, "silver_transacoes")
         process_extrato(spark, local_extrato, out_extrato_local)
-
         remove_prefix(cli, SILVER_TRANSACOES)
         upload_directory(cli, out_extrato_local, SILVER_TRANSACOES)
 
-        # ---------- PEDIDOS ----------
+        # PEDIDOS
         date_ped, obj_ped = latest_partition_and_file(cli, FAM_PEDIDOS)
         local_ped = os.path.join(work, "dados_pedidos.json")
         fget_to_local(cli, obj_ped, local_ped)
@@ -213,7 +227,7 @@ def main():
         remove_prefix(cli, SILVER_PEDIDOS_ITENS)
         upload_directory(cli, out_ped_itens, SILVER_PEDIDOS_ITENS)
 
-        # ---------- PRODUTOS ----------
+        # PRODUTOS
         date_prod, obj_prod = latest_partition_and_file(cli, FAM_PRODUTOS)
         local_prod = os.path.join(work, "dados_produtos.json")
         fget_to_local(cli, obj_prod, local_prod)
@@ -224,7 +238,7 @@ def main():
         remove_prefix(cli, SILVER_PRODUTOS)
         upload_directory(cli, out_prod, SILVER_PRODUTOS)
 
-        # ---------- TAGS ----------
+        # TAGS
         date_tags, obj_tags = latest_partition_and_file(cli, FAM_TAGS)
         local_tags = os.path.join(work, "dados_tags.json")
         fget_to_local(cli, obj_tags, local_tags)
@@ -235,7 +249,7 @@ def main():
         remove_prefix(cli, SILVER_TAGS)
         upload_directory(cli, out_tags, SILVER_TAGS)
 
-        print("\n✅ Silver publicado com sucesso!")
+        print("\n Silver publicado com sucesso.")
         print(f" - transacoes  => s3://{BUCKET}/{SILVER_TRANSACOES}")
         print(f" - pedidos_hdr => s3://{BUCKET}/{SILVER_PEDIDOS_HDR}")
         print(f" - pedidos_itens => s3://{BUCKET}/{SILVER_PEDIDOS_ITENS}")

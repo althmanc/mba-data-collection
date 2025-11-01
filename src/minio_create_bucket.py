@@ -50,7 +50,7 @@ def main():
 
     # 3. Definir nome do bucket e do objeto
     
-    def create_bucket(bucket_name, folder_path):
+    def create_bucket(bucket_name):
         """
         Verifica e cria um bucket e, em seguida, verifica e cria
         as pastas (objetos de 0 bytes) dentro dele.
@@ -68,35 +68,10 @@ def main():
             else:
                 print(f"Bucket '{bucket_name}' já existe.")
 
-            # 2. Iterar e verificar cada pasta
-            for folder in folder_path:
-                try:
-                    # Tenta obter status do objeto (pasta)
-                    minio_client.stat_object(bucket_name, folder)
-                    # Se não deu erro, a pasta já existe
-                    print(f"Pasta '{folder}' já existe em '{bucket_name}'.")
-                
-                except S3Error as e:
-                    # Se o erro for 'NoSuchKey', a pasta não existe e deve ser criada
-                    if e.code == 'NoSuchKey':
-                        print(f"Pasta '{folder}' não encontrada. Criando...")
-                        minio_client.put_object(
-                            bucket_name=bucket_name,
-                            object_name=folder,
-                            data=BytesIO(b""), # Conteúdo vazio
-                            length=0 # Tamanho 0
-                        )
-                        print(f"Pasta '{folder}' criada com sucesso.")
-                    else:
-                        # Se for outro tipo de erro (ex: Acesso Negado), exibe
-                        print(f"Erro ao verificar pasta '{folder}': {e}")
-                        raise # Re-lança o erro pois é inesperado
-
         except Exception as e:
             # Se qualquer erro geral ocorrer (ex: falha na conexão)
             print(f"\nOcorreu um erro geral durante as operações do Minio: {e}")
 
-    # create_bucket('datalake',["bronze/", "silver/"])
     create_bucket('datalake')
 
 if __name__ == '__main__':

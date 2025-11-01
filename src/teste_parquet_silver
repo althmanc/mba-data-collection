@@ -11,9 +11,9 @@ minio_client = Minio(
 )
 
 bucket = "datalake"
-prefix = "silver/pedidos_externos_itens/"   # mude para outro silver se quiser
+prefix = "silver/tags_produtos/"   # mude para outro silver se quiser
 
-# ===== 1️⃣ BAIXAR TODOS OS PARQUETS =====
+# ===== BAIXAR TODOS OS PARQUETS =====
 tmp_dir = tempfile.mkdtemp(prefix="read_parquet_minio_")
 local_files = []
 
@@ -26,9 +26,9 @@ for obj in minio_client.list_objects(bucket, prefix=prefix, recursive=True):
 if not local_files:
     raise Exception(f"Nenhum parquet encontrado em {bucket}/{prefix}")
 
-print(f"📦 {len(local_files)} arquivos baixados de {bucket}/{prefix}")
+print(f"{len(local_files)} arquivos baixados de {bucket}/{prefix}")
 
-# ===== 2️⃣ LER LOCALMENTE NO SPARK =====
+# ===== LER LOCALMENTE NO SPARK =====
 spark = (
     SparkSession.builder
     .appName("ReadParquetsFromMinIO_via_SDK")
@@ -37,14 +37,14 @@ spark = (
 
 df = spark.read.parquet(*[f"file://{p}" for p in local_files])
 
-# ===== 3️⃣ PRINTAR AS INFORMAÇÕES =====
-print("📊 SCHEMA:")
+# ===== PRINTAR AS INFORMAÇÕES =====
+print("SCHEMA:")
 df.printSchema()
 
-print("\n🔍 EXEMPLO DE LINHAS:")
+print("EXEMPLO DE LINHAS:")
 df.show(20, truncate=False)
 
-print(f"\nTotal de linhas: {df.count()}")
+print(f"Total de linhas: {df.count()}")
 
-# ===== 4️⃣ LIMPAR TMP (opcional) =====
+# ===== LIMPAR TMP (opcional) =====
 shutil.rmtree(tmp_dir, ignore_errors=True)
